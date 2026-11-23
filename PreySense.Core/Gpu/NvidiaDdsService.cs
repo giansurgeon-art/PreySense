@@ -40,6 +40,12 @@ namespace PreySense.Gpu
     /// Native NVIDIA Advanced Optimus (Dynamic Display Switch / DDS) Service.
     /// Interfaces directly with nvcpl.dll (NvCplApi) exported by NVIDIA App / Control Panel
     /// to provide genuine, reboot-free 3-mode display switching.
+    ///
+    /// nvcpl.dll is only loaded and initialized for the duration of a single call
+    /// (a "session"), then NvCplApiClose + FreeLibrary release it again. Keeping it
+    /// initialized for the life of the process leaves a live NVIDIA display-driver
+    /// session open, which can stop the driver's own automatic switch back to the
+    /// iGPU after a game closes.
     /// </summary>
     public sealed class NvidiaDdsService : IDisposable
     {
@@ -50,6 +56,10 @@ namespace PreySense.Gpu
         private const uint SettingIdDdsState = 0x332;
         private const uint SettingIdBlockingApps = 0x333;
         private const uint CommandCommit = 0x10000;
+
+        // After COMMIT the session stays open while the driver finishes the switch.
+        private const int SettleAttempts = 32;
+        private const int SettlePollMs = 250;
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern IntPtr LoadLibraryW(string lpLibFileName);
@@ -90,15 +100,43 @@ namespace PreySense.Gpu
             public uint SrType;        // PSR type
         }
 
+        /// <summary>One LoadLibrary + NvCplApiInit ... NvCplApiClose + FreeLibrary lifetime.</summary>
+        private sealed class Session : IDisposable
+        {
+            public IntPtr Module = IntPtr.Zero;
+            public bool Initialized;
+            public NvCplApiCloseDelegate? Close;
+            public NvCplApiGetInfoDelegate? GetInfo;
+            public NvCplApiGetSettingDelegate? GetSetting;
+            public NvCplApiSetSettingDelegate? SetSetting;
+            public NvCplApiExecuteDelegate? Execute;
+
+            public void Dispose()
+            {
+                if (Initialized)
+                {
+                    try { Close?.Invoke(); } catch { }
+                    Initialized = false;
+                }
+
+                GetInfo = null;
+                GetSetting = null;
+                SetSetting = null;
+                Execute = null;
+                Close = null;
+
+                if (Module != IntPtr.Zero)
+                {
+                    try { FreeLibrary(Module); } catch { }
+                    Module = IntPtr.Zero;
+                }
+            }
+        }
+
         private readonly object _syncLock = new();
-        private IntPtr _hModule = IntPtr.Zero;
-        private bool _isInitialized;
-        private NvCplApiInitDelegate? _init;
-        private NvCplApiCloseDelegate? _close;
-        private NvCplApiGetInfoDelegate? _getInfo;
-        private NvCplApiGetSettingDelegate? _getSetting;
-        private NvCplApiSetSettingDelegate? _setSetting;
-        private NvCplApiExecuteDelegate? _execute;
+        private bool _loggedInitialized;
+        private string? _lastOpenFailure;
+        private DateTime _lastOpenFailureLogTime = DateTime.MinValue;
         private int _lastGetInfoRet;
         private DateTime _lastGetInfoLogTime = DateTime.MinValue;
 
@@ -108,8 +146,8 @@ namespace PreySense.Gpu
             {
                 lock (_syncLock)
                 {
-                    EnsureInitializedLocked();
-                    return _isInitialized;
+                    using var session = OpenSessionLocked();
+                    return session != null;
                 }
             }
         }
@@ -139,72 +177,88 @@ namespace PreySense.Gpu
             return null;
         }
 
-        private bool EnsureInitializedLocked()
+        private void LogOpenFailure(string message)
         {
-            if (_isInitialized) return true;
+            if (message != _lastOpenFailure || (DateTime.UtcNow - _lastOpenFailureLogTime).TotalSeconds >= 30)
+            {
+                _lastOpenFailure = message;
+                _lastOpenFailureLogTime = DateTime.UtcNow;
+                AppLogger.Log(message);
+            }
+        }
 
+        /// <summary>
+        /// Loads nvcpl.dll and initializes its API. The caller owns the returned session
+        /// and must dispose it so the NVIDIA session is released again.
+        /// </summary>
+        private Session? OpenSessionLocked()
+        {
             string? dllPath = ResolveNvCplPath();
             if (string.IsNullOrEmpty(dllPath))
             {
-                AppLogger.Log("NvidiaDdsService: nvcpl.dll could not be found.");
-                return false;
+                LogOpenFailure("NvidiaDdsService: nvcpl.dll could not be found.");
+                return null;
             }
 
-            _hModule = LoadLibraryW(dllPath);
-            if (_hModule == IntPtr.Zero)
-            {
-                int error = Marshal.GetLastWin32Error();
-                AppLogger.Log($"NvidiaDdsService: LoadLibrary failed for {dllPath} (Error {error}).");
-                return false;
-            }
-
+            var session = new Session();
             try
             {
-                IntPtr pInit = GetProcAddress(_hModule, "NvCplApiInit");
-                IntPtr pClose = GetProcAddress(_hModule, "NvCplApiClose");
-                IntPtr pGetInfo = GetProcAddress(_hModule, "NvCplApiGetInfo");
-                IntPtr pGetSetting = GetProcAddress(_hModule, "NvCplApiGetSetting");
-                IntPtr pSetSetting = GetProcAddress(_hModule, "NvCplApiSetSetting");
-                IntPtr pExecute = GetProcAddress(_hModule, "NvCplApiExecute");
+                session.Module = LoadLibraryW(dllPath);
+                if (session.Module == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    LogOpenFailure($"NvidiaDdsService: LoadLibrary failed for {dllPath} (Error {error}).");
+                    return null;
+                }
+
+                IntPtr pInit = GetProcAddress(session.Module, "NvCplApiInit");
+                IntPtr pClose = GetProcAddress(session.Module, "NvCplApiClose");
+                IntPtr pGetInfo = GetProcAddress(session.Module, "NvCplApiGetInfo");
+                IntPtr pGetSetting = GetProcAddress(session.Module, "NvCplApiGetSetting");
+                IntPtr pSetSetting = GetProcAddress(session.Module, "NvCplApiSetSetting");
+                IntPtr pExecute = GetProcAddress(session.Module, "NvCplApiExecute");
 
                 if (pInit == IntPtr.Zero || pClose == IntPtr.Zero || pGetInfo == IntPtr.Zero ||
                     pGetSetting == IntPtr.Zero || pSetSetting == IntPtr.Zero || pExecute == IntPtr.Zero)
                 {
-                    AppLogger.Log("NvidiaDdsService: Required NvCplApi exports not found in nvcpl.dll.");
-                    FreeLibrary(_hModule);
-                    _hModule = IntPtr.Zero;
-                    return false;
+                    LogOpenFailure("NvidiaDdsService: Required NvCplApi exports not found in nvcpl.dll.");
+                    return null;
                 }
 
-                _init = Marshal.GetDelegateForFunctionPointer<NvCplApiInitDelegate>(pInit);
-                _close = Marshal.GetDelegateForFunctionPointer<NvCplApiCloseDelegate>(pClose);
-                _getInfo = Marshal.GetDelegateForFunctionPointer<NvCplApiGetInfoDelegate>(pGetInfo);
-                _getSetting = Marshal.GetDelegateForFunctionPointer<NvCplApiGetSettingDelegate>(pGetSetting);
-                _setSetting = Marshal.GetDelegateForFunctionPointer<NvCplApiSetSettingDelegate>(pSetSetting);
-                _execute = Marshal.GetDelegateForFunctionPointer<NvCplApiExecuteDelegate>(pExecute);
+                var init = Marshal.GetDelegateForFunctionPointer<NvCplApiInitDelegate>(pInit);
+                session.Close = Marshal.GetDelegateForFunctionPointer<NvCplApiCloseDelegate>(pClose);
+                session.GetInfo = Marshal.GetDelegateForFunctionPointer<NvCplApiGetInfoDelegate>(pGetInfo);
+                session.GetSetting = Marshal.GetDelegateForFunctionPointer<NvCplApiGetSettingDelegate>(pGetSetting);
+                session.SetSetting = Marshal.GetDelegateForFunctionPointer<NvCplApiSetSettingDelegate>(pSetSetting);
+                session.Execute = Marshal.GetDelegateForFunctionPointer<NvCplApiExecuteDelegate>(pExecute);
 
-                int initResult = _init();
+                int initResult = init();
                 if (initResult != 0)
                 {
-                    AppLogger.Log($"NvidiaDdsService: NvCplApiInit returned {initResult}.");
-                    FreeLibrary(_hModule);
-                    _hModule = IntPtr.Zero;
-                    return false;
+                    LogOpenFailure($"NvidiaDdsService: NvCplApiInit returned {initResult}.");
+                    return null;
                 }
 
-                _isInitialized = true;
-                AppLogger.Log($"NvidiaDdsService: Initialized {dllPath} (version {System.Diagnostics.FileVersionInfo.GetVersionInfo(dllPath).FileVersion}).");
-                return true;
+                session.Initialized = true;
+                if (!_loggedInitialized)
+                {
+                    _loggedInitialized = true;
+                    AppLogger.Log($"NvidiaDdsService: nvcpl.dll available at {dllPath} (version {System.Diagnostics.FileVersionInfo.GetVersionInfo(dllPath).FileVersion}). It is opened per call and released afterwards.");
+                }
+
+                var opened = session;
+                session = null!;
+                return opened;
             }
             catch (Exception ex)
             {
-                AppLogger.Log($"NvidiaDdsService: Initialization exception: {ex.Message}");
-                if (_hModule != IntPtr.Zero)
-                {
-                    FreeLibrary(_hModule);
-                    _hModule = IntPtr.Zero;
-                }
-                return false;
+                LogOpenFailure($"NvidiaDdsService: Initialization exception: {ex.Message}");
+                return null;
+            }
+            finally
+            {
+                // Any early return or exception above lands here with a still-owned session.
+                session?.Dispose();
             }
         }
 
@@ -218,51 +272,58 @@ namespace PreySense.Gpu
         {
             lock (_syncLock)
             {
-                if (!EnsureInitializedLocked() || _getInfo == null) return null;
+                using var session = OpenSessionLocked();
+                if (session == null) return null;
+                return ReadStatusLocked(session);
+            }
+        }
 
-                ulong size = 16;
-                IntPtr pStatus = Marshal.AllocHGlobal(16);
-                try
+        private DdsStatus? ReadStatusLocked(Session session)
+        {
+            if (session.GetInfo == null) return null;
+
+            ulong size = 16;
+            IntPtr pStatus = Marshal.AllocHGlobal(16);
+            try
+            {
+                for (int i = 0; i < 16; i++) Marshal.WriteByte(pStatus, i, 0);
+
+                int ret = session.GetInfo(InfoTypeDdsStatus, 0, pStatus, ref size);
+                if (ret == 0 && _lastGetInfoRet != 0)
                 {
-                    for (int i = 0; i < 16; i++) Marshal.WriteByte(pStatus, i, 0);
-
-                    int ret = _getInfo(InfoTypeDdsStatus, 0, pStatus, ref size);
-                    if (ret == 0 && _lastGetInfoRet != 0)
-                    {
-                        AppLogger.Log("NvidiaDdsService: NvCplApiGetInfo(0x17) recovered.");
-                        _lastGetInfoRet = 0;
-                    }
-                    if (ret == 0)
-                    {
-                        var info = Marshal.PtrToStructure<NativeDdsStatusInfo>(pStatus);
-                        var activeMux = info.MuxState switch
-                        {
-                            1 => DdsActiveMux.Optimus,
-                            2 => DdsActiveMux.dGPU,
-                            _ => DdsActiveMux.Unknown
-                        };
-
-                        return new DdsStatus(
-                            IsSupported: info.IsSupported != 0,
-                            IsAutomatic: info.IsAutomatic != 0,
-                            ActiveMux: activeMux,
-                            KmdResponse: info.KmdResponse,
-                            SrType: info.SrType
-                        );
-                    }
-
-                    if (ret != _lastGetInfoRet || (DateTime.UtcNow - _lastGetInfoLogTime).TotalSeconds >= 30)
-                    {
-                        _lastGetInfoRet = ret;
-                        _lastGetInfoLogTime = DateTime.UtcNow;
-                        AppLogger.Log($"NvidiaDdsService: NvCplApiGetInfo(0x17) status unavailable: ret={ret} ({DescribeStatusReadFailure(ret)}), returned size={size}. No display switch was requested by this read.");
-                    }
-                    return null;
+                    AppLogger.Log("NvidiaDdsService: NvCplApiGetInfo(0x17) recovered.");
+                    _lastGetInfoRet = 0;
                 }
-                finally
+                if (ret == 0)
                 {
-                    Marshal.FreeHGlobal(pStatus);
+                    var info = Marshal.PtrToStructure<NativeDdsStatusInfo>(pStatus);
+                    var activeMux = info.MuxState switch
+                    {
+                        1 => DdsActiveMux.Optimus,
+                        2 => DdsActiveMux.dGPU,
+                        _ => DdsActiveMux.Unknown
+                    };
+
+                    return new DdsStatus(
+                        IsSupported: info.IsSupported != 0,
+                        IsAutomatic: info.IsAutomatic != 0,
+                        ActiveMux: activeMux,
+                        KmdResponse: info.KmdResponse,
+                        SrType: info.SrType
+                    );
                 }
+
+                if (ret != _lastGetInfoRet || (DateTime.UtcNow - _lastGetInfoLogTime).TotalSeconds >= 30)
+                {
+                    _lastGetInfoRet = ret;
+                    _lastGetInfoLogTime = DateTime.UtcNow;
+                    AppLogger.Log($"NvidiaDdsService: NvCplApiGetInfo(0x17) status unavailable: ret={ret} ({DescribeStatusReadFailure(ret)}), returned size={size}. No display switch was requested by this read.");
+                }
+                return null;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pStatus);
             }
         }
 
@@ -279,25 +340,32 @@ namespace PreySense.Gpu
         {
             lock (_syncLock)
             {
-                if (!EnsureInitializedLocked() || _getSetting == null) return false;
+                using var session = OpenSessionLocked();
+                if (session == null) return false;
+                return HasBlockingAppsLocked(session);
+            }
+        }
 
-                IntPtr pBlocker = Marshal.AllocHGlobal(4);
-                try
+        private static bool HasBlockingAppsLocked(Session session)
+        {
+            if (session.GetSetting == null) return false;
+
+            IntPtr pBlocker = Marshal.AllocHGlobal(4);
+            try
+            {
+                Marshal.WriteInt32(pBlocker, 0);
+                uint status;
+                int ret = session.GetSetting(1, out status, SettingIdBlockingApps, pBlocker, 1);
+                if (ret == 0 && status == 0)
                 {
-                    Marshal.WriteInt32(pBlocker, 0);
-                    uint status;
-                    int ret = _getSetting(1, out status, SettingIdBlockingApps, pBlocker, 1);
-                    if (ret == 0 && status == 0)
-                    {
-                        byte val = Marshal.ReadByte(pBlocker);
-                        return val != 0;
-                    }
-                    return false;
+                    byte val = Marshal.ReadByte(pBlocker);
+                    return val != 0;
                 }
-                finally
-                {
-                    Marshal.FreeHGlobal(pBlocker);
-                }
+                return false;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pBlocker);
             }
         }
 
@@ -305,12 +373,13 @@ namespace PreySense.Gpu
         {
             lock (_syncLock)
             {
-                if (!EnsureInitializedLocked() || _setSetting == null || _execute == null)
+                using var session = OpenSessionLocked();
+                if (session == null || session.SetSetting == null || session.Execute == null)
                 {
                     return (false, "NVIDIA DDS Service is unavailable.");
                 }
 
-                if (HasBlockingApps())
+                if (HasBlockingAppsLocked(session))
                 {
                     AppLogger.Log("NvidiaDdsService: Warning: Active 3D application or display hook detected during switch.");
                 }
@@ -332,7 +401,7 @@ namespace PreySense.Gpu
                     Marshal.WriteInt32(pBuf, 4, (int)muxState);         // Target MUX State
 
                     uint status = 0;
-                    int setRet = _setSetting(1, out status, SettingIdDdsState, pBuf, 16);
+                    int setRet = session.SetSetting(1, out status, SettingIdDdsState, pBuf, 16);
                     if (setRet != 0 || status != 0)
                     {
                         AppLogger.Log($"NvidiaDdsService: NvCplApiSetSetting failed (ret={setRet}, status=0x{status:X}).");
@@ -340,14 +409,30 @@ namespace PreySense.Gpu
                     }
 
                     // Apply staged display settings immediately (NVCPL_COMMAND_COMMIT)
-                    int execRet = _execute(CommandCommit, 0, -1);
+                    int execRet = session.Execute(CommandCommit, 0, -1);
                     if (execRet != 0)
                     {
                         AppLogger.Log($"NvidiaDdsService: NvCplApiExecute(COMMIT) returned {execRet}.");
                         return (false, $"Commit display mode failed (Code {execRet}).");
                     }
 
-                    AppLogger.Log($"NvidiaDdsService: Display switch successfully applied: Mode={mode} (Auto={isAutomatic}, Mux={muxState}).");
+                    // Keep this session open until the driver reports the new state (or the
+                    // wait runs out), so closing nvcpl cannot interrupt a switch in progress.
+                    bool settled = false;
+                    for (int attempt = 0; attempt < SettleAttempts; attempt++)
+                    {
+                        var current = ReadStatusLocked(session);
+                        if (current?.Matches(mode) == true)
+                        {
+                            settled = true;
+                            break;
+                        }
+                        if (attempt < SettleAttempts - 1) Thread.Sleep(SettlePollMs);
+                    }
+
+                    AppLogger.Log(settled
+                        ? $"NvidiaDdsService: Display switch applied and confirmed: Mode={mode} (Auto={isAutomatic}, Mux={muxState})."
+                        : $"NvidiaDdsService: Display switch committed: Mode={mode} (Auto={isAutomatic}, Mux={muxState}); the driver had not reported the new state yet.");
                     return (true, $"GPU Display Mode set to {mode}.");
                 }
                 finally
@@ -359,37 +444,13 @@ namespace PreySense.Gpu
 
         public void Dispose()
         {
+            // Nothing stays open between calls; sessions are released as each call finishes.
             lock (_syncLock)
             {
-                if (_isInitialized)
-                {
-                    try
-                    {
-                        _close?.Invoke();
-                    }
-                    catch { }
-
-                    _isInitialized = false;
-                }
-
-                _init = null;
-                _close = null;
-                _getInfo = null;
-                _getSetting = null;
-                _setSetting = null;
-                _execute = null;
-
-                if (_hModule != IntPtr.Zero)
-                {
-                    try
-                    {
-                        FreeLibrary(_hModule);
-                    }
-                    catch { }
-
-                    _hModule = IntPtr.Zero;
-                }
+                _loggedInitialized = false;
+                _lastOpenFailure = null;
             }
         }
     }
 }
+
