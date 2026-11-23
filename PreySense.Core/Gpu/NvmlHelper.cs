@@ -28,6 +28,36 @@ namespace PreySense.Gpu
         private static IntPtr _cachedDevice = IntPtr.Zero;
         private static uint _cachedGpuIndex = uint.MaxValue;
 
+        // NVML keeps a live driver session while initialized. Telemetry can stop sampling at
+        // any moment (window hidden, overlay off, game closed), so NVML releases itself once
+        // it has gone unused instead of waiting for another poll to shut it down.
+        private const int IdleReleaseMs = 5000;
+        private static System.Threading.Timer? _idleTimer;
+        private static long _lastUseTicks;
+
+        private static void TouchLocked()
+        {
+            _lastUseTicks = Environment.TickCount64;
+            _idleTimer ??= new System.Threading.Timer(ReleaseIfIdle, null,
+                System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+            _idleTimer.Change(IdleReleaseMs, System.Threading.Timeout.Infinite);
+        }
+
+        private static void ReleaseIfIdle(object? state)
+        {
+            lock (_lock)
+            {
+                if (!_init) return;
+                long idleMs = Environment.TickCount64 - _lastUseTicks;
+                if (idleMs < IdleReleaseMs)
+                {
+                    _idleTimer?.Change((int)(IdleReleaseMs - idleMs) + 50, System.Threading.Timeout.Infinite);
+                    return;
+                }
+                ShutdownLocked();
+            }
+        }
+
         private static void EnsureInitializedLocked()
         {
             if (_init) return;
@@ -51,6 +81,7 @@ namespace PreySense.Gpu
                 device = IntPtr.Zero;
                 return false;
             }
+            TouchLocked();
             if (_cachedDevice != IntPtr.Zero && _cachedGpuIndex == gpuIndex)
             {
                 device = _cachedDevice;
@@ -160,17 +191,24 @@ namespace PreySense.Gpu
         {
             lock (_lock)
             {
-                _cachedDevice = IntPtr.Zero;
-                _cachedGpuIndex = uint.MaxValue;
-                if (!_init) return;
-                try
-                {
-                    int rc = nvmlShutdown();
-                    AppLogger.Log($"NVML Shutdown: {rc}");
-                }
-                catch { }
-                _init = false;
+                ShutdownLocked();
             }
+        }
+
+        private static void ShutdownLocked()
+        {
+            _cachedDevice = IntPtr.Zero;
+            _cachedGpuIndex = uint.MaxValue;
+            _idleTimer?.Change(System.Threading.Timeout.Infinite, System.Threading.Timeout.Infinite);
+            if (!_init) return;
+            try
+            {
+                int rc = nvmlShutdown();
+                AppLogger.Log($"NVML Shutdown: {rc}");
+            }
+            catch { }
+            _init = false;
         }
     }
 }
+
