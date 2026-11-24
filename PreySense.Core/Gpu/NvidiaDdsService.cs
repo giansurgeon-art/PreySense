@@ -193,6 +193,8 @@ namespace PreySense.Gpu
         /// </summary>
         private Session? OpenSessionLocked()
         {
+            if (DiagSwitches.Has("dds")) return null;
+
             string? dllPath = ResolveNvCplPath();
             if (string.IsNullOrEmpty(dllPath))
             {
@@ -453,4 +455,3 @@ namespace PreySense.Gpu
         }
     }
 }
-
