@@ -63,6 +63,7 @@ namespace PreySense.Frontend.Services
         string? ITelemetrySources.ReadDisplayGpuName() => DisplayManager.GetPrimaryDisplayGpuName();
         NvidiaGpuControl.Metrics ITelemetrySources.ReadGpu(TelemetryMetrics metrics)
         {
+            if (DiagSwitches.Has("gpu")) return default;
             // Read Windows' cached power data before touching NVAPI/NVML or even
             // constructing the GPU client. Missing/asleep adapters remain asleep.
             if (DeviceHelper.GetDisplayDevicePowerState("VEN_10DE") != 1)
