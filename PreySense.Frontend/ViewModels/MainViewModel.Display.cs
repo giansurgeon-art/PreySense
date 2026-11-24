@@ -54,7 +54,7 @@ namespace PreySense.Frontend.ViewModels
 
         private void OnDisplaySettingsChanged(object? sender, EventArgs e)
         {
-            if (_disposed) return;
+            if (_disposed || PreySense.DiagSwitches.Has("displaywatch")) return;
             TriggerDisplayStateRefresh();
         }
 
