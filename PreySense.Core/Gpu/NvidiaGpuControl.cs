@@ -228,6 +228,10 @@ namespace PreySense.Gpu
 
         private static PhysicalGPU? GetInternalDiscreteGpu()
         {
+            // Lite mode: never initialize NVAPI or enumerate the NVIDIA GPU, so every NVAPI/NVML
+            // path in this class (telemetry, clock-tuning discovery when the tuning window opens)
+            // sees "no GPU" and returns without touching the driver.
+            if (DiagSwitches.Has("gpu")) return null;
             try
             {
                 return PhysicalGPU
